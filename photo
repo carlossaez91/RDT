@@ -1,0 +1,1409 @@
+debugMode = enableDebug;
+
+ModernScreen.disablePredictive("All");
+
+NONMENU = 0;
+MENU = 1;
+BOTH = 2;
+ERROR = 3;
+WARNING = 4;
+INFO = 5;
+MESSAGE = 6;
+
+var lastScreen = null;
+
+
+if( typeof( View ) === "undefined" ) {
+	View = {};
+	View.evaluateJavascript = function(text){debug("evaluateJavascript: '" + text + "'");};
+}
+
+
+
+//Lets make sure if they are trying to use voice that the voice scripts are present
+if( ( enableTTS || enableSTT ) && typeof(rapidVoice) === "undefined" ) {
+	enableTTS = false;
+	enableSTT = false;
+	debug("You are trying to use voice but the Rapid Voice scripts have not been added to your project.");
+}
+
+//This object stores the keyboard info for context keyboards. 
+var contextKeyboard = {
+	show: null,
+	name: null
+};
+//Need to setup a scope handler to handle contextual keyboards. Parsescreen happens too early to override the project defaults for show/hide keyboard
+WLEvent.on("EnterScope", keyboardHandler );
+
+function keyboardHandler( event ) {
+
+	try{
+		if( event.scope.indexOf(":") > -1 ) {
+			
+			checkForContextKeyboard( lastScreen );
+			
+			if( contextKeyboard.name !== null ) {
+				Keyboard.changeKeyboard( contextKeyboard.name );
+			}
+			
+			if( contextKeyboard.show !== null ) {
+				Keyboard.toggleVisible( contextKeyboard.show );
+			}
+		}
+	}
+	catch( error ) { debug("Could not complete context keyboard", error);}
+}
+
+function checkForContextKeyboard( screen ) {
+	var field = null;
+	for( var row =0; row< screen.elements.length; row++ ) {
+		for( var i=0; i<screen.elements[row].length; i++) {
+			if( screen.elements[row][i].type === rules.field.type ) {
+					//Only save if field has cursor on it
+					var el = screen.elements[row][i];
+					if(	row === screen.getCursorPosition().row && 
+						el.col <= screen.getCursorPosition().column &&
+						(el.col + el.text.length) >= screen.getCursorPosition().column
+					) {
+						field = {};
+						field.row = row;
+						field.index = i;
+						field.element = el;
+					}
+			}
+			
+		}
+	}	
+	
+	//Lets see if there is a label before or above the field
+	var fieldLabel = null;
+	if( !field ) return;
+	
+	if( field.index > 0 && screen.elements[field.row][field.index-1].type === rules.label.type ) {
+		fieldLabel = screen.elements[field.row][field.index-1].text.trim();
+		debug( "Field Label", fieldLabel );
+	}
+	//If there is no label below, maybe there is one above
+	else if( field.row > 0 ) {
+		for( var i=0; i<screen.elements[field.row-1].length; i++ ) {
+			var el = screen.elements[field.row-1][i];
+			if( 	el.type === rules.label.type && 
+				el.col <= field.element.col && 
+				(el.col + el.text.length ) >= field.element.col 
+			) {
+				fieldLabel = el.text.trim();
+				debug( "Field Label", fieldLabel );
+			}
+		}
+	}
+	
+	if( !fieldLabel ) {
+		contextKeyboard.show = null;
+		contextKeyboard.name = null;
+		return;
+	}
+	
+	
+	//Now lets see if we have a keyboard tied to this label
+	for( var i=0; i< rules.contextKeyboards.length; i++ ) {
+		if( rules.contextKeyboards[i].label === fieldLabel ) {
+			contextKeyboard.show = rules.contextKeyboards[i].show;
+			contextKeyboard.name = rules.contextKeyboards[i].keyboardName;
+			debug( "Setting context keyboard", contextKeyboard );
+			return;
+		}
+	}
+	
+	//Dot forget user defined keyboards
+	if( typeof( userContextKeyboards ) !== "undefined" ) {
+		for( var i=0; i< userContextKeyboards.length; i++ ) {
+			if( userContextKeyboards[i].label === fieldLabel ) {
+				contextKeyboard.show = userContextKeyboards[i].show;
+				contextKeyboard.name = userContextKeyboards[i].name;
+				debug( "Setting context keyboard", contextKeyboard );
+				return;
+			}
+		}
+	}
+	
+	//If no match found, lets null the values
+	contextKeyboard.show = null;
+	contextKeyboard.name = null;
+	
+}
+
+var rules = getRules();
+var shortcuts = [];
+
+if (typeof globalButtons === "undefined")
+	globalButtons = [];
+	
+if (typeof globalContextMenuItems === "undefined")
+	globalContextMenuItems = [];
+
+debug("Called");
+var screenType = "";
+
+function start( screen ) {
+
+	//Insert the javascript that controls hiding content when the screen gets too small
+	performInsert(); 
+	
+	//Used to hold non screen elements  for the speakeasy functions
+	screen.extras = [];
+
+	//Do the rapid screen parsing
+	parseScreen( screen );
+		
+	//Need to add global shortcuts and Buttons to the screen object so the speakeasy functions can see them
+	for( var i=0; i< globalButtons.length; i++ ) {
+		screen.extras.push(globalButtons[i]);
+	}
+	for( var i=0; i< globalContextMenuItems.length; i++ ) {
+		var found = false;
+		for( var x=0; x<screen.extras.length; x++ ) {
+			if( 	screen.extras[x].label === globalContextMenuItems[i].label &&
+				screen.extras[x].macro === globalContextMenuItems[i].macro 
+			) {
+				found = true;
+				break;
+			}
+		}
+		if( !found ) screen.extras.push( globalContextMenuItems[i] );
+	}
+	
+	//Save the screen in case we need it later
+	lastScreen = screen;
+	
+	//Now lets call the tts and stt processor (If enabled)
+	if( enableTTS && enableSTT ) rapidVoice( "BOTH", screen, rules);
+	
+	//Now lets call the tts processor (If enabled)
+	else if( enableTTS ) rapidVoice( "TTS", screen, rules);
+	
+	//Now lets call the stt processor (If enabled)
+	else if( enableSTT ) rapidVoice( "STT", screen, rules);
+}
+
+function parseScreen( screen ) {
+	//Have to reset this custom variable
+	screen.hideField = false;
+	
+	
+	//TODO: Turn off normal parsing
+	debug( "Parsing Screen");
+	shortcuts = [];
+	//TODO: look for screen boxes
+	
+	debug("Checking for custom screen...");
+	if( rules.customScreen ) {
+		for( var i=0; i< rules.customScreen.length; i++ ) {
+		
+			//Let see if the cursor falls in one of the cursorZones if any were defined
+			if( 	rules.customScreen[i].cursorZones && 
+				rules.customScreen[i].cursorZones.length > 0 ){
+				
+				var found = false;
+				var cursor = screen.getCursorPosition();
+				for( var x=0; x<rules.customScreen[i].cursorZones.length; x++ ) {
+						if( cursor.row === rules.customScreen[i].cursorZones[x].row &&
+						    cursor.column >= rules.customScreen[i].cursorZones[x].col &&
+						    cursor.column <= rules.customScreen[i].cursorZones[x].col + rules.customScreen[i].cursorZones[x].length ) {
+						 	found = true;
+						 	break;
+						}
+				}
+				if( !found ) continue; //No sense in going any further if no cursor match 
+			}
+			
+			//Need to keep track of keytextMatches
+			var matchIndex = 0;
+		
+			for( var row = rules.customScreen[i].minRow; row <= rules.customScreen[i].maxRow; row++ ) {
+			
+				if( screen.getTextAt( row, rules.minCol, rules.maxCol - rules.minCol ).match(rules.customScreen[i].keyText[matchIndex])  ) {
+					
+					matchIndex++;
+				}
+				
+				if( matchIndex >= rules.customScreen[i].keyText.length ) {
+					//All matches are met
+					debug("Custom Screen Found!");
+					screen.showGlobalShortcuts = true; //Need a way for the custom function to overide adding global shortcuts
+					screen.footer = null; //Can be set by custom function to combine custom footer elements with the global shortcuts
+					rules.customScreen[i].customParser(screen);
+					if( screen.showGlobalShortcuts ) addGlobalShortcuts( screen, screen.footer );
+					return;
+				}
+			}	
+		}
+	}
+	
+	debug( "Past custom screen detection --- Not a custom screen!" );
+	
+	debug("Checking for message screen...");
+	for( var i=0; i< rules.messageScreen.length; i++ ) {
+		debug("checkingformessage", rules.messageScreen[i]); 
+		for( var row = rules.messageScreen[i].minRow; row <= rules.messageScreen[i].maxRow; row++ ) {
+			var text = screen.getTextAt( row, rules.minCol, rules.maxCol - rules.minCol );
+			
+			//Use search text if we have it
+			if( rules.messageScreen[i].searchText ) {
+				debug("Using searchText"); 
+				
+				if( rules.messageScreen[i].topRegex ) {
+					for( var r = rules.messageScreen[i].minRow; r <= rules.messageScreen[i].maxRow; r++ ) {
+						if( screen.getTextAt( r, rules.minCol, rules.maxCol - rules.minCol ).match(rules.messageScreen[i].topRegex)  ) {
+							if( parseMessageScreen(screen, rules.messageScreen[i], r) ) {
+								screen.type = MESSAGE;
+								debug("End of message found");
+								return;
+							}
+							else row = 1000;
+						}
+					}
+				}
+				else if( parseMessageScreen(screen, rules.messageScreen[i], row) ) {
+					screen.type = MESSAGE;
+					debug("End of message found");
+					return;
+				}
+				else row = 1000;
+			
+			}
+			else if( text.match(rules.messageScreen[i].topRegex)  ) { //If no search text use the top regex
+				if( parseMessageScreen(screen, rules.messageScreen[i], row) ) {
+					screen.type = MESSAGE;
+					debug("End of message found");
+					return;
+				}
+				else row = 1000;
+				
+			}
+		}
+	} 
+	debug( "Past Message");
+		
+	debug("Checking for menu...");
+	for( var i=0; i< rules.menu.length; i++ ) {
+		for( var row = rules.menu[i].minRow; row <= rules.menu[i].maxRow; row++ ) {
+		
+			if( screen.getTextAt( row, rules.minCol, rules.maxCol - rules.minCol ).match(rules.menu[i].regex)  ) {
+				debug("Menu Found!");
+				parseMenu(screen, rules.menu[i]);
+				screen.type = MENU;
+				return;
+			}
+		}
+	}
+	debug( "Past menu detection --- Not a menu!" );
+
+	
+	parseNonMenu( screen );
+	screen.type = NONMENU;
+}
+
+function parseMessageScreen(screen, messageRules, line) { 
+
+	debug( "Checking for message on line: ", line );
+	if( line === rules.maxRow ) return false;
+
+	var title = "";
+	if( messageRules.topRegex ) {
+		title = messageRules.topRegex.exec(screen.getTextAt( line, rules.minCol, rules.maxCol - rules.minCol ));
+		if( title.length === 1 ) title = title[0];
+		else title = title[1];
+		line++;
+	}
+	
+	var message = "";
+	
+	var foundBottom = false;
+	for( var row=line; row<messageRules.maxRow; row++ ) {
+		var text = screen.getTextAt( row, rules.minCol, rules.maxCol - rules.minCol );
+		if( text.match( messageRules.bottomRegex ) ) {
+			i = 1000;
+			foundBottom = true;
+			break;
+		}
+		text = messageRules.lineRegex.exec(text);
+		if( text ) {
+			if( text.length === 1 ) text = text[0];
+			else text = text[1];
+			message += text;
+		}
+	}
+	if( !foundBottom ) return false;
+	
+	
+	switch( messageRules.type ) {
+	
+		case ERROR:
+			screen.add( screen.createErrorMessage(line, 0, message, title, "" ) );
+			break;
+		case WARNING:
+			screen.add( screen.createWarningMessage(line, 0, message, title, "" ) );
+			break;
+		case INFO:
+			screen.add( screen.createInfoMessage(line, 0,  message, title, "" ) );
+			break;
+	}
+	
+	var span = null;
+	for( var b=0; b< messageRules.buttons.length; b++) {
+		if( !span ) span = screen.createSpanGroup();
+		span.add( screen.createButton( line, b, messageRules.buttons[b].label, messageRules.buttons[b].macro ) );
+	}
+	if( span ) screen.add( span );
+	
+	return true;
+} 
+
+function parseMenu( screen, menuRules ) {
+	debug( "Parsing Menu");
+	screenType = MENU;
+	var footer = null;
+	var elementFilter = [rules.menuItem.type, rules.shortcut.type, rules.title.type, rules.label.type, rules.button.type, rules.message.type];
+	if( rules.field.screenType === MENU || rules.field.screenType === BOTH ) elementFilter.push(rules.field.type);
+
+	
+	var elements = getElementTable( screen, elementFilter );
+	for( var row = 0; row< elements.length; row++ ) {
+	
+		if( !elements[row] ) continue;
+		
+		var span = null;
+		for( var i=0; i<elements[row].length; i++) {
+			//debug( "Converting: ", elements[row][i] );
+			if( !elements[row][i] || elements[row][i].type === "empty" ) continue;
+			
+			if( 	elements[row][i].type === rules.title.type ||
+				elements[row][i].type === rules.message.type
+			) {
+				var e = convertElement( screen, elements[row][i]);
+				if( e ) screen.add(e);
+			}
+			else if( elements[row][i].type === rules.shortcut.type ) {
+				if( shortcutLocation === "FOOTER" || shortcutLocation === "BOTH" ) {
+					if( !footer ) {
+						footer = screen.createFooter( 24,0 );
+						screen.add(footer);
+					}
+					footer.add( convertElement( screen, elements[row][i] ) );
+				}
+				if( shortcutLocation === "CONTEXT MENU" || shortcutLocation === "BOTH" ) {
+					screen.add( screen.createShortcut(0, 0, elements[row][i].label, elements[row][i].macro) );
+				}
+			}
+			else if( elements[row][i].type === rules.menuItem.type ) {
+				var e = convertElement( screen, elements[row][i] ) ;
+				if ( e )screen.add( e );
+			}
+			else {
+				var e = convertElement( screen, elements[row][i] ) ;
+				if( e ) {
+					if( !span ) span = screen.createSpanGroup();
+					span.add( e );
+				}
+			}
+		}
+		if( span ) screen.add(span);
+	}
+	 addGlobalShortcuts( screen, footer );
+
+	
+}
+
+function addGlobalShortcuts( screen, footer ) {
+	
+	for( var i=0; i< globalButtons.length; i++ ) {
+		if( !footer ) {
+			footer = screen.createFooter( 24,0 );
+			screen.add(footer);
+		}
+		footer.add( screen.createButton( 0, 0, globalButtons[i].label, globalButtons[i].macro )  );		
+	}
+	
+	
+	for( var i=0; i< globalContextMenuItems.length; i++ ) {
+		screen.add( screen.createShortcut(0, 0, globalContextMenuItems[i].label, globalContextMenuItems[i].macro) );
+	}
+}
+
+function parseNonMenu( screen ) {
+	screenType = NONMENU;
+	
+	//Create object array to hold basic object data
+	//	row, col, length, text, type
+	//Loop through rows and split elements into array of lineElements
+	//Parse lineElements into objects
+	//Identify field and insert at proper position
+	//Parse objects into virtual tables
+	
+	//Parse virtual tables into screen elements
+	debug("getting element table" );
+	var elements = getElementTable(screen, null);
+	debug("parsing element table");
+	var footer = null;
+	var footerSpan = null;
+	var addToEnd = [];
+	for( var row=0; row< elements.length; row++ ) {
+		
+		var span = null;
+		
+		if( !elements[row] ) continue;
+		
+		//Create seperation between tables
+		if( rules.newTableOnEmptyLine && elements[row].length === 0 && row > 0 && elements[row-1].length !== 0 ) {
+			screen.add( screen.createDataLabel( row, 0, "") );
+		}
+		
+		for( var i=0; i<elements[row].length; i++ ) {
+			debug( elements[row][i].type );
+			if( !elements[row][i] || typeof( elements[row][i] ) === "undefined" ) continue;
+			debug( "Converting Element", elements[row][i]);
+			switch( elements[row][i].type ) {
+				case "empty":
+					screen.add( screen.createHeader(row, 0, "")  );
+					break;
+				case rules.title.type:
+					screen.add( convertElement( screen, elements[row][i] ) );
+					break;
+				case rules.button.type: 
+					if( !span ) span = screen.createSpanGroup();
+									
+					var labels = [];
+					if( !elements[row][i].rule.inline ) {
+						labels.push(replace(elements[row][i].text));
+					}
+					else {
+						//Do the splitting here
+						//Account for no group or single group regex return
+						labels = elements[row][i].text.split( elements[row][i].rule.regex );
+					}
+					
+					for( var x=0; x<labels.length; x++ ) {
+					
+						span.add(  screen.createDataLabel( row, i, replace(labels[x]) ) );
+						if( labels.length === 1 || x< labels.length-1 ) {
+							for( var b=0; b<elements[row][i].rule.subButtons.length; b++ ) {
+								var button =  elements[row][i].rule.subButtons[b];
+								if(elements[row][i].rule.endOfLine) {
+									addToEnd.push( screen.createButton( row, i+100,button.label, button.macro ) );
+								}
+								else {
+									span.add( screen.createButton( row, i,button.label, button.macro ) );
+								}
+							}
+						}
+					}
+					
+					
+					break;
+				case rules.shortcut.type:
+
+					if( shortcutLocation === "FOOTER" || shortcutLocation === "BOTH" ) {
+						
+						if( !footer ){
+							footer = screen.createFooter(24,0);	
+							screen.add(footer);
+						}
+						
+						footer.add( convertElement( screen, elements[row][i] ) );
+					}
+					if( shortcutLocation === "CONTEXT MENU" || shortcutLocation === "BOTH" ) {
+						screen.add( screen.createShortcut(0, 0, elements[row][i].label, elements[row][i].macro) );
+					}
+					
+					break;
+				case rules.field.type:
+					if( typeof(screen.hideField) !== "undefined" && !screen.hideField ) {
+						if( !span ) span = screen.createSpanGroup();
+						span.add( convertElement( screen, elements[row][i] ) );
+					}
+					break;
+				case rules.message.type:
+					screen.add(convertElement( screen, elements[row][i] ));
+					break;
+				default:
+					if( !span ) span = screen.createSpanGroup();
+					span.add( convertElement( screen, elements[row][i] ) );
+					break;
+			}
+		}
+		
+		//Append any things set to be added to the end of the line
+		if( addToEnd.length > 0 && !span ) span = screen.createSpanGroup();
+		for(var e = 0; e<addToEnd.length; e++ ) span.add(addToEnd[e]);
+		addToEnd = [];
+		
+		if( span ) screen.add( span );
+	}
+	 addGlobalShortcuts( screen, footer );
+
+}
+
+function convertElement( screen, element ) {
+	
+	if( !element || typeof( element ) === "undefined" )return null;
+	
+	switch( element.type ) {
+			case "empty":
+				return null;
+				break;
+			case rules.title.type:
+				debug("Creating banner");
+				return screen.createBanner(element.text, "res://velocity/resources/" + bannerImage);
+				break;
+			case rules.message.type:
+				debug("MESSAGE", element);
+				if( !element.text || element.text.trim() === "" ) return null;
+				if( element.rule.type === ERROR ) {
+					debug("error");
+					return screen.createErrorMessage(element.row, 1,  element.text, "", "");
+				}
+				else if( element.rule.type ===  WARNING) {
+					debug("warning");
+					return screen.createWarningMessage(element.row, 1,  element.text, "", "");
+				}
+				else if( element.rule.type ===  INFO) {
+					debug("info");
+					return screen.createInfoMessage(element.row, 1, element.text, "", "");
+				}
+				break;
+			case rules.menuItem.type:
+				return screen.createMenuItem(element.row, element.col, element.label, element.macro);
+				break;
+			case rules.shortcut.type:
+			case rules.button.type:
+				debug("Creating button\shortcut:", element);
+				return screen.createButton(element.row, element.col, element.label, element.macro);
+				break;
+			case rules.label.type:
+				return screen.createDataLabel(element.row, element.col, element.text)
+				break;
+			case rules.field.type:
+				return screen.createField(element.row, element.col, element.text.length)
+				break;
+			default: //Value
+				return screen.createDataValue(element.row, element.col, element.text.length)
+				break;
+				
+		}
+}
+
+function checkForBox( screen ) {
+
+	debug("Checking for box");
+	if( !rules.screenBox  ) return null;
+	
+	var box = {};
+
+	for( var x=0; x<rules.screenBox.length; x++ ) {
+		for( var row = rules.minRow; row<=rules.maxRow; row++ ) {
+			var result;
+			if( result = rules.screenBox[x].topRegex.exec(screen.getTextAt( row, rules.minCol, rules.maxCol-rules.minCol )) ) {
+				box.startRow = row;
+				box.startCol = rules.minCol + result.index + 1;
+				box.endCol = box.startCol + result[0].length -2;
+			}
+			else if( typeof(box.startRow) !== "undefined") {
+				if( screen.getTextAt( row, rules.minCol, rules.maxCol-rules.minCol ).match( rules.screenBox[x].bottomRegex) ) {
+					box.endRow = row;
+				}
+			}
+		}
+	}
+	
+	if( 	typeof(box.startRow) === "undefined" ||
+		typeof(box.endRow) === "undefined" ) {
+			return null;
+		}
+	debug( JSON.stringify(box) );
+	return box;
+}
+
+function getElementTable( screen, elementFilter ) {
+
+	var elements = new Array(24);
+	
+	
+	//See if we have a title
+	generateLineElement( screen, elements, elementFilter, rules.title );
+
+	//See if we have any messages 
+	generateLineElement(screen, elements, elementFilter, rules.message );
+
+	debug( "", elements );
+	
+	var box = checkForBox(screen);
+	
+	for( var row = rules.minRow; row<=rules.maxRow; row++ ) {
+		if( typeof(elements[row]) === "undefined" )
+			elements[row] = getElements( screen, row, elementFilter, box );
+	}
+	
+	debug( "", elements );
+	
+	//Save the elements off to the screen object so we can use them later
+	screen.elements = elements;
+
+	return elements;
+}
+
+function generateLineElement(screen, elements, elementFilter, m) {
+	
+	if( !m ) return;
+	if( !elementFilter || elementFilter.indexOf(m.type) > -1 ) 
+	{
+		for( var i=0; i<m.length; i++ ) {
+			debug("Checking for line elements against", m[i]);
+			//Have we already created something on this line
+			if( m[i].minRow < 0 || typeof(elements[m[i].minRow]) !== "undefined" ) continue;
+			
+			//Is there any other reason to disqualify this?
+			if( !checkScreenType( m[i].screenType ) ) continue;
+			
+			var msg = "";
+
+			var regexMatchRow = null;
+			for( var row=m[i].minRow; row<=m[i].maxRow; row++ ) {
+				var line = screen.getTextAt( row, rules.minCol, rules.maxCol-rules.minCol );
+				debug("Checking line: " + line);
+				
+				if( !regexMatchRow ) {
+					if( !m[i].regex || line.match(m[i].regex) ) {
+						regexMatchRow = row;
+						debug("row: " + row);
+					}
+				}
+				if( regexMatchRow !== null ) {
+					msg += line +  " ";		
+				}					
+			}
+			msg = msg.trim();
+			
+			debug("Message: " + msg);
+			
+			if( msg !== "" )
+			{
+				msg = replace(msg);
+				var e = new Object();
+				e.type = m.type;
+				e.text = msg;
+				e.row = regexMatchRow;
+				e.col = m[i].minCol;
+				e.rule = m[i];
+				elements[e.row] = [e];
+				
+				
+				
+				
+				//Need to also search the message text to see if there are any button matches, if so we can add a span with buttons below. 
+				//We cannot support inline though because buttons cannot be added to messages.
+				for( var x=0; x< rules.button.length; x++ ) {
+						if( row >= rules.button[x].minRow && 
+							row <= rules.button[x].maxRow &&
+							e.text.match(rules.button[x].regex) ) {
+							
+							if( rules.button[x].subButtons.length > 0 ) {
+								var buttonSpan = screen.createSpanGroup();
+								
+								//Need a copy of the rules so we can turn off inline without messing with original
+								var clonedRules = JSON.parse(JSON.stringify(rules.button[x]));
+								clonedRules.inline = false;
+								
+								elements[e.row].push({type:rules.button.type, text: "", row: e.row, col: 0, rule: clonedRules });
+								//for( var b=0; b<rules.button[x].subButtons.length; b++ ) {
+								//	elements[e.row].push({type:rules.button.type, text: rules.button[x].subButtons[b].label, macro: rules.button[x].subButtons[b].macro, row: e.row, col: b+1, rule: clonedRules });
+									//buttonSpan.add(screen.createButton(row,0,rules.button[x].subButtons[b].label, rules.button[x].subButtons[b].macro));
+								//}
+							}
+						}
+				}
+				
+				
+				
+				
+				
+				for( var row=e.row+1; row<=m[i].maxRow; row++ ) {
+					elements[row] = [{type: "empty"}];
+				}
+						
+			}
+			
+		}
+	}
+}
+
+function getElements( screen, row, elementFilter, box ) {
+	debug("getElements Called");
+	debug( "row", row );
+	debug("elementFilter", elementFilter);
+	
+	var line;
+	var startCol;
+	var endCol;
+	if( typeof(box) === "undefined" || !box  ) {
+		line = screen.getTextAt( row,rules.minCol,rules.maxCol - rules.minCol );
+		startCol = rules.minCol;
+		endCol = rules.maxCol;
+	}
+	else if( row>box.startRow && row<box.endRow ) {
+		line = screen.getTextAt( row,box.startCol,box.endCol - box.startCol );
+		startCol = box.startCol;
+		endCol = box.endCol;
+	}
+	else	 {
+		elementFilter = [];
+		elementFilter.push(rules.shortcut.type);
+		elementFilter.push(rules.button.type);
+		line = screen.getTextAt( row,rules.minCol,rules.maxCol - rules.minCol );
+		startCol = rules.minCol;
+		endCol = rules.maxCol;
+	}
+
+		
+	debug( line );
+	//Split based on attributes first
+	var oldAttr = null;
+	var newAttr = null;
+	var oldChar = null;
+	var newChar = "";
+	var tempElements = [];
+	
+	var index = 0;
+	for( var col=startCol; col<endCol; col++ ) {
+
+		newAttr = screen.getAttributeAt( row, col );
+		newChar = screen.getTextAt( row, col, 1 );
+
+		if( oldAttr === null ) {
+			oldAttr = newAttr;
+			oldChar = newChar;
+			continue;
+		}
+	
+		if( 	oldAttr !== newAttr || 
+			( oldChar !== newChar && (oldChar === "_" || newChar === "_") ) ) {
+			var oldBytes = getBytes( oldAttr );
+			debug( "oldBytes", oldBytes );
+			var newBytes = getBytes( newAttr );
+			debug("newBytes", newBytes);
+			if( 	(rules.splitOnBoldChange && boldChanged( oldBytes, newBytes ) ) ||
+				((rules.splitOnUnderlineChange || (rules.field.useUnderlines && screenType !== MENU) ) && underlineChanged(oldBytes, newBytes, oldChar, newChar) ) ||
+				((rules.splitOnReverseVideoChange || rules.field.useReverseVideo ) && reverseVideoChanged( oldBytes, newBytes) ) ||
+				(rules.splitOnBackgroundColorChange && backgroundColorChanged( oldBytes, newBytes ) ) ||
+				(rules.splitOnforeGroundColorChange && foregroundColorChanged( oldBytes, newBytes ) ) ||
+				(rules.splitOnBlinkChange && blinkChanged( oldBytes, newBytes ) ) ||
+				(rules.splitOnItalicChange && italicChanged( oldBytes, newBytes ) ) ||
+				(rules.splitOnPasswordChange && passwordChanged( oldBytes, newBytes ) ) )
+			{
+					debug( "Change Detected in attributes at row:" + row + ", col:" + col);
+					var el = line.slice( index , col-startCol ); //Have tosubtract startCol to account for boxes we are not capturing in the line
+					tempElements.push( el ) ;
+					//line = line.slice( col  );
+					index += el.length;
+			}
+			oldAttr = newAttr;
+		}
+		oldChar = newChar;
+	}
+	line = line.slice(index);
+	if( line.trim() !== "" || screen.getCursorPosition().row === row ) tempElements.push( line ); //Make sure to grab the last bit, also added a catch for rows that are empty but have the cursor
+	debug("tempElements", tempElements);
+	var textElements = [];
+	
+	//Now split based on elementSeperators
+	for( var i=0; i<tempElements.length; i++ ) {
+		//for( var f=0; f<fields.length; f++ ) {
+		//	if( fields[f].element === tempElements[i] ) continue;
+		//}
+
+		var elArray = tempElements[i].split( rules.elementSeperatorsRegex  );
+		//debug( "elArray", elArray );
+		if( elArray.length == 0 ) continue;
+		textElements = textElements.concat(elArray ) ;
+	}
+	
+	if( typeof(rules.image) !== "undefined" && rules.image.enabled ) {
+  if( textElements.length === 1 && textElements[0].trim() === "" ) {
+    textElements.pop();
+  }
+  if( elementFilter && elementFilter.indexOf( rules.image.type ) > -1 ) {
+    textElements.push(rules.image.markup);
+  }
+}
+	
+	
+	
+	
+	debug("textElements", textElements);
+		
+
+
+		var col =startCol;
+		var fields = [];
+		var attrBytes;
+		var cursor = screen.getCursorPosition();
+	
+	//Detect fields
+	for( var i=0; i<textElements.length; i++ ) {
+		attrBytes = getBytes(screen.getAttributeAt( row, col ));
+		if( 		(!elementFilter || elementFilter.indexOf( rules.field.type ) > -1 ) &&
+				(rules.field.displayMultipleFields || (cursor.row === row && cursor.column >= col && cursor.column <= (col + textElements[i].length-1) )) &&(
+				(rules.field.useUnderlines && isUnderline( attrBytes ) ) ||
+				(rules.field.useReverseVideo && isReverseVideo( attrBytes ) ) ||
+				(rules.field.useBgColorBlack && isBgBlack( attrBytes ) ) ||
+				(rules.field.useBgColorRed && isBgRed( attrBytes ) ) ||
+				(rules.field.useBgColorGreen && isBgGreen( attrBytes ) ) ||
+				(rules.field.useBgColorYellow && isBgYellow( attrBytes ) ) ||
+				(rules.field.useBgColorBlue && isBgBlue( attrBytes ) ) ||
+				(rules.field.useBgColorMagenta && isBgMagenta( attrBytes ) ) ||
+				(rules.field.useBgColorCyan && isBgCyan( attrBytes ) ) ||
+				(rules.field.useBgColorGray && isBgGray( attrBytes ) ) ||
+				(rules.field.useBgColorWhite && isBgWhite( attrBytes ) ) ||
+				(rules.field.useUnderscores && textElements[i].indexOf("_") > -1) ||
+				(rules.field.drawFieldIfNoOthersFound && (cursor.row === row && cursor.column >= col && cursor.column <= (col + textElements[i].length-1) ))
+			)) {
+				var skip = false;
+				for( var x=0; x<rules.ignoreCursorPosition.length; x++ ) {
+						if( rules.ignoreCursorPosition[x].row === row && 
+							row === cursor.row && 
+							rules.ignoreCursorPosition[x].minCol <= col &&
+							rules.ignoreCursorPosition[x].maxCol >= col )
+							skip = true;
+				}
+				
+				if( rules.field.regex && !textElements[i].match(rules.field.regex) ) skip = true;
+				
+				if( !skip ) {
+					debug( "Found Field at: row: " + row + ", col: " + col);
+					fields.push({startCol: col, endCol: col + textElements[i].length, element: textElements[i]});
+				}
+			}
+			col+=textElements[i].length;
+	}							
+
+
+	
+	var lineElements = [];
+	col=startCol;
+	for( var i=0; i<textElements.length; i++ ) {
+	
+		var e = new Object();
+		
+		var inField = function() {
+			for( var f=0; f< fields.length; f++ ) {
+				debug(" Comapring startCol: " + col + ", endCol: " + (col+textElements[i].length), [fields[f].startCol, fields[f].endCol, textElements[i]]);
+				if( fields[f].startCol === col && fields[f].endCol === col + textElements[i].length ) 
+					return true;
+			}
+			//Trim whitespace off the end of the last element in the row, prevents unecessary wrapping
+			if( i === textElements.length-1) {
+				if(  textElements[i] )
+					textElements[i] = textElements[i].replace(/\s+$/, '')
+			}
+			return false;
+		};
+		
+		if( 	inField() && (
+								!rules.ignoreCursorIfOnButton || 
+								(	rules.ignoreCursorIfOnButton && 
+									!matchesElementArray( textElements[i], rules.button) && 
+									!matchesElementArray( textElements[i], rules.shortcut) &&
+									!matchesElementArray( textElements[i], rules.menuItem)
+								)
+							)
+		)  {
+			debug( "Found Field at: row: " + row + ", col: " + col);
+			e.type = rules.field.type;
+			e.minRow = rules.field.minRow;
+			e.maxRow = rules.field.maxRow;
+			fieldFound = true;
+		}
+		else if( textElements[i].trim().length === 0 ) {
+			col += textElements[i].length;
+			continue;
+		}
+		else if( 	(menuRule = matchesElementArray( textElements[i], rules.menuItem ))  ) {
+			debug("MenuItem Found", textElements[i]);
+			var result = textElements[i].match( menuRule.regex );
+			
+			if( !menuRule.reverse ) {
+				e.label = replace(result[1]);
+				e.macro = menuRule.macroPrefix + result[2] + menuRule.macroPostfix;
+			}
+			else {
+				e.label = replace(result[2]);
+				e.macro = menuRule.macroPrefix + result[1] + menuRule.macroPostfix;
+			}
+			
+			//Need to update the macro if using cursorSelectItem
+			if( menuRule.cursorSelect )
+				e.macro = "{script:cursorSelectItem( '" + menuRule.cursorSelect.upCommand + "', '" + menuRule.cursorSelect.upCommand + "', " +  row + ", " + col + ", " + col+textElements[i].length + ");}";
+					
+			e.minRow = menuRule.minRow;
+			e.maxRow = menuRule.maxRow;
+			e.type = rules.menuItem.type;
+			e.rule = menuRule;
+		}
+		else if( 	(buttonRule = matchesElementArray( textElements[i], rules.button)) ) {
+			
+			if( buttonRule.hideField === true ) screen.hideField = true;
+			
+			var result = textElements[i].match( buttonRule.regex );
+			
+			if( !buttonRule.reverse ) {
+				e.label = result[2];
+				e.macro = buttonRule.macroPrefix + result[1] + buttonRule.macroPostfix;
+			}
+			else {
+				e.label = result[1];
+				e.macro = buttonRule.macroPrefix + result[2] + buttonRule.macroPostfix;
+			}
+			e.minRow = buttonRule.minRow;
+			e.maxRow = buttonRule.maxRow;
+			e.type = rules.button.type;
+			e.rule = buttonRule;
+			
+			if( buttonRule.postProcessor ) {
+				e.row = row;
+				e.col = col;
+				e = buttonRule.postProcessor( e, screen );
+				e.label = replace( e.label );
+			}
+		}
+		else if( 	(shortcutRule = matchesElementArray( textElements[i], rules.shortcut)) ) {
+			var result = textElements[i].match( shortcutRule.regex );
+			
+			if( !shortcutRule.reverse ) {
+				e.label = replace(result[2]);
+				
+				if( typeof( shortcutRule.cursorSelect ) !== "undefined" && shortcutRule.cursorSelect )
+					e.macro = "{script:cursorSelectItem( '" + shortcutRule.cursorSelect.upCommand + "', '" + shortcutRule.cursorSelect.downCommand + "', '" + shortcutRule.cursorSelect.submitCommand + "',"+  row + ", " + col + ", " + (col+textElements[i].length) + ");}";
+				else	
+					e.macro = shortcutRule.macroPrefix + result[1] + shortcutRule.macroPostfix;
+			}
+			else {
+				e.label = replace(result[1]);
+				
+				if( typeof( shortcutRule.cursorSelect ) !== "undefined" && shortcutRule.cursorSelect )
+					e.macro = "{script:cursorSelectItem( '" + shortcutRule.cursorSelect.upCommand + "', '" + shortcutRule.cursorSelect.downCommand + "', '" + shortcutRule.cursorSelect.submitCommand + "',"+  row + ", " + col + ", " + (col+textElements[i].length) + ");}";
+				else
+					e.macro = shortcutRule.macroPrefix + result[2] + shortcutRule.macroPostfix;
+			}
+			e.minRow = shortcutRule.minRow;
+			e.maxRow = shortcutRule.maxRow;
+			e.type = rules.shortcut.type;
+			e.rule = shortcutRule;
+			
+			if( shortcutRule.postProcessor ) {
+				e.row = row;
+				e.col = col;
+				e = shortcutRule.postProcessor( e, screen );
+				e.label = replace(e.label);
+			}
+		}
+		else if( 	(labelRule = matchesElementArray( textElements[i], rules.label )) ) {
+		
+			e.type = rules.label.type;
+			e.minRow = labelRule.minRow;
+			e.maxRow = labelRule.maxRow;
+			e.rule = labelRule;
+		}
+		else {
+			e.type = "value";
+			e.minRow = rules.value.minRow;
+			e.maxRow = rules.value.maxRow;
+		}
+		
+		if( e.type === rules.label.type ) 
+			e.text = replace(textElements[i]);
+		else
+			e.text = textElements[i];
+		e.row = row;
+		e.col = col;
+			
+		if( !elementFilter || elementFilter.indexOf( e.type ) > -1) 
+			if( e.minRow <= row && e.maxRow >=row  )
+				lineElements.push(e);
+
+
+		col += textElements[i].length;
+		//debug(col);
+	}	
+	debug("lineElements", lineElements);
+	//if( lineElements.length > 0 ) return lineElements;
+	
+	//make sure the cursor isnt on this line and did not get converted
+	var skip = false;
+	var cursor = screen.getCursorPosition();
+	for( var x=0; x<rules.ignoreCursorPosition.length; x++ ) {
+			if( rules.ignoreCursorPosition[x].row === row && 
+				rules.ignoreCursorPosition[x].row === cursor.row && 
+				rules.ignoreCursorPosition[x].minCol <= cursor.column &&
+				rules.ignoreCursorPosition[x].maxCol >= cursor.column )
+				skip = true;
+	}
+	if( !skip && !rules.ignoreCursorIfOnButton ) {
+
+		if( !elementFilter || elementFilter.indexOf( rules.field.type ) > -1)  {
+			var found = false;
+			if( cursor.row === row ) {
+			
+				if( lineElements.length === 0 ) {
+					debug ( "cursor found on empty row");
+					var field = {};
+					field.type = rules.field.type;
+					field.minRow = rules.field.minRow;
+					field.maxRow = rules.field.maxRow;
+					field.startCol = cursor.column;
+					field.endCol = endCol;
+					field.row = row;
+					field.col = cursor.column;
+					field.text = screen.getTextAt( row, field.col, endCol-field.col );
+					lineElements.push( field );
+					found = true;
+				}
+				else {		
+					for( var i=0; i<lineElements.length; i++ ) {
+						if(  lineElements[i].col <=cursor.column && typeof( lineElements[i].text ) !== "undefined" && lineElements[i].col + lineElements[i].text.length > cursor.column ) {
+							if( lineElements[i].type !== rules.button.type && lineElements[i].type !== rules.menuItem.type && lineElements[i].type !== rules.shortcut.type ) {
+								lineElements[i].type = rules.field.type;
+								debug("Converting element to field:", lineElements[i]);
+								found = true;
+							}
+						}
+					}
+				}
+
+			}
+		}
+	}
+	return lineElements;
+
+	
+}
+
+function matchesElementArray( text, elementRules ) {
+	for( var i=0;  i<elementRules.length; i++ ) {
+		if( checkScreenType( elementRules[i].screenType ) && elementRules[i].regex !== null && text.match( elementRules[i].regex ) )
+			return elementRules[i];
+	}
+	return null;
+}
+
+function getBytes( i ) {	
+	return ("00000000" + i.toString(16)).substr( -8 );
+}
+
+function boldChanged( a, b ) {
+	if( (a[3] === '1' && b[3] !== '1') ||
+		(b[3] === '1' && a[3] !== '1'))
+		return true;
+	else
+		return false;
+}
+
+function underlineChanged( a, b, oldChar, newChar ) {
+	
+	//Added '6' because some systems use 6 instead of 2
+	//Go from underline to no underline
+	if( ( a[3] === '2' || a[3] === '6' || a[3] === '3' || oldChar === "_" ) && (b[3] !== '2' && b[3] !== '6' && b[3] !== '3' && newChar !== "_" ) ) {
+		debug("underline changes"); 
+		return true;
+	}
+	
+	//Go from no underline to underline
+	if( (a[3] !== '2' && a[3] !== '6' && a[3] !== '3' && oldChar !== "_" ) && (b[3] === '2' || b[3] === '6' || b[3] === '3' || newChar === "_" ) ) {
+		debug("underline changes"); 
+		return true;
+	}
+	
+	//if we get this far than no change happened
+	return false;
+}
+
+function reverseVideoChanged( a, b ) {
+	if( (a[3] === '4' && b[3] !== '4') ||
+		(b[3] === '4' && a[3] !== '4'))
+		return true;
+	else
+		return false;
+}
+
+function backgroundColorChanged( a, b ) {
+	if( a[4] !== b[4] || a[5] !== b[5] )
+		return true;
+	else
+		return false;
+}
+
+function foregroundColorChanged( a, b ) {
+	if( a[6] !== b[6] || a[7] !== b[7] )
+		return true;
+	else
+		return false;
+}
+
+function blinkChanged( a, b ) {
+	if( (a[3] === '8' && b[3] !== '8') ||
+		(b[3] === '8' && a[3] !== '8'))
+		return true;
+	else
+		return false;
+}
+
+function italicChanged( a, b ) {
+	if( (a[2] === '1' && b[2] !== '1') ||
+		(b[2] === '1' && a[2] !== '1'))
+		return true;
+	else
+		return false;
+}
+
+function  passwordChanged( a, b ) {
+	if( (a[2] === '4' && b[2] !== '4') ||
+		(b[2] === '4' && a[2] !== '4'))
+		return true;
+	else
+		return false;
+}
+
+function isUnderline( bytes ) {
+	//Added '6' because some systems use 6 instead of 2
+	if( bytes[3] === '2' || bytes[3] === '6' || bytes[3] === '3' ) return true;
+	else return false;
+}
+
+function isReverseVideo( bytes ) {
+	if( bytes[3] === '4' ) return true;
+	else return false;
+}
+
+
+function isBgBlack( bytes ) {
+	if(bytes[4] === '0' && bytes[5] === '0') return true;
+	else return false;
+}
+
+function isBgRed( bytes ) {
+	//Account for regular and bright
+	if(bytes[4] === '0' && (bytes[5] === '1' || bytes[5] === '9')) return true;
+	else return false;
+}
+
+function isBgGreen( bytes ) {
+	//Account for regular and bright
+	if(bytes[4] === '0' && (bytes[5] === '2' || bytes[5] === 'A')) return true;
+	else return false;
+}
+
+function isBgYellow( bytes ) {
+	//Account for regular and bright
+	if(bytes[4] === '0' && (bytes[5] === '3' || bytes[5] === 'B')) return true;
+	else return false;
+}
+
+function isBgBlue( bytes ) {
+	//Account for regular and bright
+	if(bytes[4] === '0' && (bytes[5] === '4' || bytes[5] === 'C')) return true;
+	else return false;
+}
+
+function isBgMagenta( bytes ) {
+	//Account for regular and bright
+	if(bytes[4] === '0' && (bytes[5] === '5' || bytes[5] === 'D')) return true;
+	else return false;
+}
+
+function isBgCyan( bytes ) {
+	//Account for regular and bright
+	if(bytes[4] === '0' && (bytes[5] === '6' || bytes[5] === 'E')) return true;
+	else return false;
+}
+
+function isBgGray( bytes ) {
+	//Account for regular and bright
+	if(bytes[4] === '0' && (bytes[5] === '7' || bytes[5] === '8')) return true;
+	else return false;
+}
+
+function isBgWhite( bytes ) {
+	if(bytes[4] === '0' && bytes[5] === 'F') return true;
+	else return false;
+}
+
+//Add in items we didnt ant to be edited during configuration
+//Clean up some items on load to save on processing later
+function preprocessRules() {
+	rules.title.type = "title";
+	rules.menuItem.type = "menuItem";
+	rules.shortcut.type = "shortcut"
+	rules.button.type = "button";
+	rules.label.type = "label";
+	rules.field.type = "field";
+	rules.message.type = "message";
+	rules.value.type = "value";
+	
+	//Make sure we dont go out of bounds
+	rules.minRow = Math.max( rules.minRow, 0 );
+	rules.maxRow = Math.min( rules.maxRow, 23 );		
+	rules.minCol = Math.max( rules.minCol, 0 );	
+	rules.maxCol =  Math.min( rules.maxCol, 79);	
+	
+	//Setup ttsReplace to be a global variable
+	if( typeof(ttsReplace) === "undefined" ) ttsReplace = [];
+	if( typeof(rules.ttsReplace) === "undefined" ) rules.ttsReplace = [];
+	
+	for( var i=0; i<rules.ttsReplace.length; i++ ) {
+		ttsReplace.push( rules.ttsReplace[i]);
+	}
+	
+	
+	//Setup ignore cursor position
+	if( !rules.ignoreCursorPosition ) rules.ignoreCursorPosition = [];
+	
+	//Convert elementSeperators into regex
+	var r = "";
+	for( var i=0; i<rules.elementSeperators.length; i++ ) {
+		var prefix = "";
+		//Make sure the seperator is not empty or null
+		if( !rules.elementSeperators[i] || rules.elementSeperators[i].length === 0 ) continue;
+		
+		//Is it already a regex?? If so then lets convert it to a string so we can add it to the larger regex. We also need to remove the / from beginning and end
+		if( rules.elementSeperators[i] instanceof RegExp ) rules.elementSeperators[i] = rules.elementSeperators[i].toString().substr(1).slice(0, -1);
+		
+		//If spliting on spaces then we need to make sure something is before the spaces or we will split too often
+		if( rules.elementSeperators[i].trim() == "" ) prefix = "\\w"
+		r += "(?<=" + prefix + rules.elementSeperators[i] + ")";
+		if( i<rules.elementSeperators.length-1 ) r += "|";
+	}
+	debug( "Done creating split regex", r );
+	rules.elementSeperatorsRegex = new RegExp(r, 'g');
+	
+	//Add rules.textReplace to global textReplace
+	if (typeof textReplace === "undefined")
+		textReplace = [];
+	
+	if( rules.textReplace ) {
+		for( var i=0; i<rules.textReplace.length; i++)
+			textReplace.push( rules.textReplace[i] );
+	}
+	
+	//Add rules.ttsReplace to global ttsReplace
+	if (typeof ttsReplace === "undefined")
+		ttsReplace = [];
+	
+	if( rules.ttsReplace ) {
+		for( var i=0; i<rules.ttsReplace.length; i++)
+			ttsReplace.push( rules.ttsReplace[i] );
+	}
+	
+	//Add rules.ttsMode to global ttsMode
+	if (typeof ttsMode === "undefined")
+		ttsMode = [];
+	
+	if( rules.ttsMode ) {
+		for( var i=0; i<rules.ttsMode.length; i++)
+			ttsMode.push( rules.ttsMode[i] );
+	}
+	
+}
+
+function debug( text, obj ) {
+	
+	if( !debugMode ) return;
+
+	if( obj ) 
+		text += ": " + JSON.stringify(obj);
+	Logger.debug( text );
+}
+
+function checkScreenType( type ) {
+
+	if( type === BOTH || type === screenType ) return true;
+	return false;
+	
+}
+
+function replace( text ) {
+	if( typeof(text) === "undefined" ) return text;
+	
+	for( var i = 0; i< textReplace.length; i++)
+		text = text.replace(new RegExp(textReplace[i].orig, 'g'), textReplace[i].replace);
+	return text;
+}
+
+function performInsert() {
+	var js = 'if( typeof( insertPerformed ) === "undefined" ) {';
+	js +=	'	insertPerformed = true;';
+	js +=	'	var fileref = document.createElement("script");';
+	js +=	'	fileref.setAttribute("type","text/javascript");';
+	js +=	'	fileref.setAttribute("src", "http://velocity/resources/pageJS.js");';
+	js += 	'	document.head.appendChild(fileref);';
+	js +=	'}';
+	
+	View.evaluateJavascript(js, "");
+}
+
+
+//Variables and function to help accomodate menu items and shortcuts that need the cursor to be on 
+//them before submitting
+var cursorSelectCounter = 0;
+var onUpdatedFunction = null;
+cursorSelectItem = function( upCommand, downCommand, submitCommand, row, minCol, maxCol ) {
+	
+	if( cursorSelectCounter === 0 ) {
+		
+		onUpdatedFunction = function(){  cursorSelectItem( upCommand, downCommand, submitCommand, row, minCol, maxCol ); };
+		WLEvent.on( "ScreenUpdated", onUpdatedFunction );
+	}
+	else if( cursorSelectCounter >= 40) { //Lets make sure we dont get in an endless loop, best to stop after too many tries.
+		cursorSelectCounter = 0;
+		WLEvent.off( "ScreenUpdated", onUpdatedFunction );
+		return;
+	}
+
+	var c = Screen.getCursorPosition();
+	if( upCommand && (c.row > row || c.column < minCol ) )
+		Device.sendKeys( "{" + upCommand + "}" );
+	else if( c.row !== row || c.column < minCol || c.column > maxCol )
+		Device.sendKeys( "{" + downCommand + "}" );
+	else {
+		Device.sendKeys( "{" + submitCommand + "}" );
+		cursorSelectCounter = 0;
+		WLEvent.off( "ScreenUpdated", onUpdatedFunction );
+	}
+	
+	cursorSelectCounter++;
+}
+
+function agregarTextoEnCampo() {
+  var campoDeTexto = "prebuilt_3"; // Nombre del campo de texto en el que se agregará el texto
+  var nuevoTexto = "Hola mundo"; // Texto que se agregará en el campo de texto
+  
+  // Obtener el texto actual del campo de texto
+  var textoActual = Screen.getText(campoDeTexto);
+
+  // Verificar si el campo de texto existe en la pantalla
+  if (textoActual !== undefined) {
+    // Concatenar el nuevo texto con el texto actual del campo de texto
+    var textoNuevo = textoActual + " " + nuevoTexto;
+
+    // Establecer el nuevo texto en el campo de texto
+    Screen.setText(textoNuevo, campoDeTexto);
+  }
+}
+
+WLEvent.on("ScreenChanged", agregarTextoEnCampo);
+
+
+
+preprocessRules();
+WLEvent.on("ParseScreen", start);
+
+
+
+
